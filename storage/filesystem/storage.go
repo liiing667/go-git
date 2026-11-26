@@ -260,6 +260,57 @@ func (s *Storage) SetObjectFormat(of formatcfg.ObjectFormat) error {
 	return nil
 }
 
+// SetConfig writes the configuration and keeps the active storage hashers in
+// sync when its object format changes. As with [Storage.SetObjectFormat], an
+// object-format change is only permitted while the object store has no packs.
+func (s *Storage) SetConfig(cfg *config.Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	effective := cfg.Extensions.ObjectFormat
+	if effective == formatcfg.UnsetObjectFormat {
+		effective = formatcfg.SHA1
+	}
+
+	current := s.options.ObjectFormat
+	if current == formatcfg.UnsetObjectFormat {
+		current = formatcfg.SHA1
+	}
+
+	formatChanged := effective != current
+	if formatChanged {
+		packs, err := s.dir.ObjectPacks()
+		if err != nil {
+			return err
+		}
+		if len(packs) > 0 {
+			return errors.New("cannot change object format of existing object storage")
+		}
+	}
+
+	if err := s.ConfigStorage.SetConfig(cfg); err != nil {
+		return err
+	}
+
+	if !formatChanged {
+		return nil
+	}
+
+	if err := s.dir.SetObjectFormat(effective); err != nil {
+		return fmt.Errorf("cannot set object format on dotgit: %w", err)
+	}
+
+	s.ConfigStorage.objectFormat = effective
+	s.ModuleStorage.objectFormat = effective
+	s.ShallowStorage.objectFormat = effective
+	s.options.ObjectFormat = effective
+	s.oh = plumbing.FromObjectFormat(effective)
+	s.hasher = plumbing.NewHasher(effective, plumbing.AnyObject, 0)
+	s.h = s.hasher.Hash
+	return nil
+}
+
 // SupportsExtension checks whether the Storer supports the given
 // Git extension defined by name.
 func (s *Storage) SupportsExtension(name, value string) bool {

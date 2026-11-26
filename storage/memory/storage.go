@@ -131,6 +131,14 @@ func (c *ConfigStorage) SetConfig(cfg *config.Config) error {
 		return err
 	}
 
+	// Match the filesystem backend's write boundary: marshalling validates
+	// section, subsection and key names before the configuration is accepted.
+	// The encoded bytes are not retained, but marshalling also materialises
+	// the typed fields in Raw so the two views cannot diverge.
+	if _, err := cfg.Marshal(); err != nil {
+		return err
+	}
+
 	c.config = cfg
 	return nil
 }
@@ -142,6 +150,40 @@ func (c *ConfigStorage) Config() (*config.Config, error) {
 	}
 
 	return c.config, nil
+}
+
+// SetConfig stores configuration and keeps the in-memory object hasher aligned.
+func (s *Storage) SetConfig(cfg *config.Config) error {
+	effective := cfg.Extensions.ObjectFormat
+	if effective == formatcfg.UnsetObjectFormat {
+		effective = formatcfg.SHA1
+	}
+
+	current := s.options.objectFormat
+	if current == formatcfg.UnsetObjectFormat {
+		current = formatcfg.SHA1
+	}
+
+	formatChanged := effective != current
+	if formatChanged && (len(s.Blobs) > 0 ||
+		len(s.Commits) > 0 ||
+		len(s.Objects) > 0 ||
+		len(s.Tags) > 0 ||
+		len(s.Trees) > 0) {
+		return errors.New("cannot change object format of existing object storage")
+	}
+
+	if err := s.ConfigStorage.SetConfig(cfg); err != nil {
+		return err
+	}
+
+	if !formatChanged {
+		return nil
+	}
+
+	s.options.objectFormat = cfg.Extensions.ObjectFormat
+	s.oh = plumbing.FromObjectFormat(effective)
+	return nil
 }
 
 // IndexStorage implements storer.IndexStorer for in-memory storage.

@@ -78,8 +78,17 @@ func (a *AdvRefs) resolvedHeadFromSymref(head *plumbing.Reference) *plumbing.Ref
 // SymbolicReference when possible, and symref capabilities applied to
 // other references. The result is sorted by reference name.
 func (a *AdvRefs) ResolvedReferences() ([]*plumbing.Reference, error) {
-	refs := make([]*plumbing.Reference, len(a.References))
-	copy(refs, a.References)
+	refs := make([]*plumbing.Reference, 0, len(a.References))
+	for _, ref := range a.References {
+		name := ref.Name()
+		if name.IsPeeled() {
+			name = plumbing.ReferenceName(strings.TrimSuffix(name.String(), "^{}"))
+		}
+		if !validAdvertisedName(name) {
+			continue
+		}
+		refs = append(refs, ref)
+	}
 
 	if a.supportSymrefs() {
 		for name, target := range a.symRefMap() {

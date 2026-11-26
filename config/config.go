@@ -419,6 +419,13 @@ func Paths(scope Scope) ([]string, error) {
 
 // Validate validates the fields and sets the default values.
 func (c *Config) Validate() error {
+	switch c.Extensions.ObjectFormat {
+	case format.UnsetObjectFormat, format.SHA1, format.SHA256:
+	default:
+		return fmt.Errorf("extensions.objectformat %q: %w",
+			c.Extensions.ObjectFormat, format.ErrInvalidObjectFormat)
+	}
+
 	for name, r := range c.Remotes {
 		if r.Name != name {
 			return ErrInvalid

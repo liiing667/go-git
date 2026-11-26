@@ -59,8 +59,11 @@ func ClientCapabilities(server capability.List) capability.List {
 	if agent := server.Get(capability.Agent); len(agent) > 0 {
 		caps.Set(capability.Agent, capability.DefaultAgent())
 	}
-	if of := server.Get(capability.ObjectFormat); len(of) > 0 {
-		caps.Set(capability.ObjectFormat, of[0])
+	if of := server.Get(capability.ObjectFormat); len(of) == 1 {
+		switch formatcfg.ObjectFormat(of[0]) {
+		case formatcfg.SHA1, formatcfg.SHA256:
+			caps.Set(capability.ObjectFormat, of[0])
+		}
 	}
 	return caps
 }

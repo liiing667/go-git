@@ -102,42 +102,12 @@ func NegotiatePack(
 		upreq.Capabilities.Set(capability.NoProgress)
 	}
 
+	clientFormat, err := reconcileObjectFormat(st, caps)
+	if err != nil {
+		return nil, err
+	}
+
 	if caps.Supports(capability.ObjectFormat) {
-		var clientFormat, serverFormat config.ObjectFormat
-		if capValues := caps.Get(capability.ObjectFormat); len(capValues) > 0 {
-			of := config.ObjectFormat(capValues[0])
-			switch of {
-			case config.SHA1, config.SHA256:
-				serverFormat = of
-			}
-		}
-
-		cfg, err := st.Config()
-		if err == nil {
-			clientFormat = cfg.Extensions.ObjectFormat
-		}
-
-		if clientFormat == config.UnsetObjectFormat && serverFormat == config.SHA256 {
-			ref, err := st.Reference(plumbing.HEAD)
-			if err == nil && ref.Target().String() == "refs/heads/.invalid" {
-				if setter, ok := st.(xstorage.ObjectFormatSetter); ok {
-					err := setter.SetObjectFormat(serverFormat)
-					if err != nil {
-						return nil, fmt.Errorf("unable to set object format: %w", err)
-					}
-					clientFormat = serverFormat
-				}
-			}
-		}
-
-		if clientFormat == config.UnsetObjectFormat {
-			clientFormat = config.SHA1
-		}
-
-		if serverFormat != clientFormat {
-			return nil, fmt.Errorf("mismatched algorithms: client %s; server %s", clientFormat, serverFormat)
-		}
-
 		upreq.Capabilities.Set(capability.ObjectFormat, clientFormat.String())
 	}
 
@@ -316,16 +286,26 @@ func readShallows(
 	return nil
 }
 
-// ReconcileObjectFormatV2 aligns the storer's object format with the Protocol
-// v2 server's advertised object-format before any packfile is requested. On a
-// fresh clone the storer's format is unset (HEAD still points at the
-// refs/heads/.invalid placeholder) and the server's sha256 is adopted;
-// otherwise a mismatch is a hard error, since indexing a sha256 pack as sha1
-// (or vice versa) corrupts the store and only surfaces later as a checksum
-// failure. It mirrors NegotiatePack's v0/v1 object-format handling and git's
+// ReconcileObjectFormat aligns the storer's object format with the server's
+// advertised object-format before any packfile is requested. On a fresh clone
+// the storer's format is unset (HEAD still points at the refs/heads/.invalid
+// placeholder) and the server's sha256 is adopted; otherwise a mismatch is a
+// hard error, since indexing a sha256 pack as sha1 (or vice versa) corrupts
+// the store and only surfaces later as a checksum failure. It follows git's
 // fetch-pack.c, including the case where the server omits object-format (it
 // only speaks sha1) but the client repository uses another algorithm.
+func ReconcileObjectFormat(st storage.Storer, caps capability.List) error {
+	_, err := reconcileObjectFormat(st, caps)
+	return err
+}
+
+// ReconcileObjectFormatV2 is the Protocol v2 name for [ReconcileObjectFormat].
+// Protocol v0/v1 negotiation applies the same reconciliation.
 func ReconcileObjectFormatV2(st storage.Storer, caps capability.List) error {
+	return ReconcileObjectFormat(st, caps)
+}
+
+func reconcileObjectFormat(st storage.Storer, caps capability.List) (config.ObjectFormat, error) {
 	var clientFormat config.ObjectFormat
 	if cfg, err := st.Config(); err == nil && cfg != nil {
 		clientFormat = cfg.Extensions.ObjectFormat
@@ -337,9 +317,10 @@ func ReconcileObjectFormatV2(st storage.Storer, caps capability.List) error {
 		// Upstream errors when the client repo uses a different algorithm
 		// rather than letting it fail later on a checksum mismatch.
 		if clientFormat != config.UnsetObjectFormat && clientFormat != config.SHA1 {
-			return fmt.Errorf("the server does not support algorithm '%s'", clientFormat)
+			return config.SHA1, fmt.Errorf("%w: the server does not support algorithm '%s'",
+				config.ErrObjectFormatMismatch, clientFormat)
 		}
-		return nil
+		return config.SHA1, nil
 	}
 
 	var serverFormat config.ObjectFormat
@@ -347,19 +328,49 @@ func ReconcileObjectFormatV2(st storage.Storer, caps capability.List) error {
 	case config.SHA1, config.SHA256:
 		serverFormat = v
 	case config.UnsetObjectFormat:
+		for _, value := range advertised[1:] {
+			switch extra := config.ObjectFormat(value); extra {
+			case config.UnsetObjectFormat, config.SHA1:
+			case config.SHA256:
+				return config.UnsetObjectFormat, fmt.Errorf("%w: server advertised conflicting object-format values %q and %q",
+					config.ErrObjectFormatMismatch, config.SHA1, extra)
+			default:
+				return config.UnsetObjectFormat, fmt.Errorf("%w: server advertised unsupported object-format %q",
+					config.ErrInvalidObjectFormat, extra)
+			}
+		}
+
 		// An empty value carries no algorithm; treat it exactly as an absent
 		// object-format (the server only speaks sha1). Apply the same guard as
 		// the len(advertised)==0 branch so a client repo on a different
 		// algorithm is rejected rather than slipping past to fail later on a
 		// checksum mismatch.
 		if clientFormat != config.UnsetObjectFormat && clientFormat != config.SHA1 {
-			return fmt.Errorf("the server does not support algorithm '%s'", clientFormat)
+			return config.SHA1, fmt.Errorf("%w: the server does not support algorithm '%s'",
+				config.ErrObjectFormatMismatch, clientFormat)
 		}
-		return nil
+		return config.SHA1, nil
 	default:
 		// An algorithm go-git does not speak. Fail fast rather than proceed
 		// with the wrong hash format, matching NegotiatePack's v0/v1 handling.
-		return fmt.Errorf("server advertised unsupported object-format %q", v)
+		return config.UnsetObjectFormat, fmt.Errorf("%w: server advertised unsupported object-format %q",
+			config.ErrInvalidObjectFormat, v)
+	}
+
+	// object-format takes exactly one algorithm. A malformed or mixed
+	// advertisement must not be partially accepted and used to rewrite the
+	// repository configuration. Repeated identical values are tolerated for
+	// peers that duplicate the capability line.
+	for _, value := range advertised[1:] {
+		extra := config.ObjectFormat(value)
+		if extra != serverFormat {
+			if extra == config.SHA1 || extra == config.SHA256 {
+				return config.UnsetObjectFormat, fmt.Errorf("%w: server advertised conflicting object-format values %q and %q",
+					config.ErrObjectFormatMismatch, serverFormat, extra)
+			}
+			return config.UnsetObjectFormat, fmt.Errorf("%w: server advertised unsupported object-format %q",
+				config.ErrInvalidObjectFormat, extra)
+		}
 	}
 
 	// Adopt the server format on a fresh clone: unset client + sha256 server,
@@ -368,7 +379,7 @@ func ReconcileObjectFormatV2(st storage.Storer, caps capability.List) error {
 		if ref, err := st.Reference(plumbing.HEAD); err == nil && ref.Target().String() == "refs/heads/.invalid" {
 			if setter, ok := st.(xstorage.ObjectFormatSetter); ok {
 				if err := setter.SetObjectFormat(serverFormat); err != nil {
-					return fmt.Errorf("unable to set object format: %w", err)
+					return config.UnsetObjectFormat, fmt.Errorf("unable to set object format: %w", err)
 				}
 				clientFormat = serverFormat
 			}
@@ -379,8 +390,16 @@ func ReconcileObjectFormatV2(st storage.Storer, caps capability.List) error {
 		clientFormat = config.SHA1
 	}
 
-	if serverFormat != clientFormat {
-		return fmt.Errorf("mismatched algorithms: client %s; server %s", clientFormat, serverFormat)
+	switch clientFormat {
+	case config.SHA1, config.SHA256:
+	default:
+		return clientFormat, fmt.Errorf("%w: local repository uses unsupported object-format %q",
+			config.ErrInvalidObjectFormat, clientFormat)
 	}
-	return nil
+
+	if serverFormat != clientFormat {
+		return clientFormat, fmt.Errorf("%w: mismatched algorithms: client %s; server %s",
+			config.ErrObjectFormatMismatch, clientFormat, serverFormat)
+	}
+	return clientFormat, nil
 }
