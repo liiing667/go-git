@@ -55,6 +55,7 @@ const (
 	alternatesPath     = "alternates"
 
 	tmpPackedRefsPrefix = "._packed-refs"
+	tmpShallowPrefix    = "shallow"
 	packedRefsHeader    = "# pack-refs with: "
 
 	packPrefix = "pack-"
@@ -459,9 +460,81 @@ func (d *DotGit) StatIndex() (os.FileInfo, error) {
 	return d.fs.Stat(indexPath)
 }
 
-// ShallowWriter returns a file pointer for write to the shallow file
+// ShallowWriter returns a file pointer for write to the shallow file. It
+// truncates the file first; use [DotGit.ReplaceShallow] to update an existing
+// boundary without exposing a partial one.
 func (d *DotGit) ShallowWriter() (billy.File, error) {
 	return d.fs.Create(shallowPath)
+}
+
+// ReplaceShallow replaces the shallow file with content atomically. An empty
+// content removes the file, as Git does when no commit is shallow.
+//
+// The content is written to a temporary file that is renamed over the shallow
+// file, so a failed or interrupted write leaves the previous boundary intact.
+func (d *DotGit) ReplaceShallow(content []byte) error {
+	if len(content) == 0 {
+		if err := d.fs.Remove(shallowPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+
+	f, err := d.shallowTempFile()
+	if err != nil {
+		return err
+	}
+
+	tmp := f.Name()
+	if n, err := f.Write(content); err != nil {
+		_ = f.Close()
+		_ = d.fs.Remove(tmp)
+		return err
+	} else if n != len(content) {
+		_ = f.Close()
+		_ = d.fs.Remove(tmp)
+		return io.ErrShortWrite
+	}
+	if err := f.Close(); err != nil {
+		_ = d.fs.Remove(tmp)
+		return err
+	}
+
+	if err := d.fs.Rename(tmp, shallowPath); err != nil {
+		_ = d.fs.Remove(tmp)
+		if !errors.Is(err, billy.ErrNotSupported) {
+			return err
+		}
+		return d.writeShallow(content)
+	}
+
+	return nil
+}
+
+// shallowTempFile creates the temporary file ReplaceShallow renames over the
+// shallow file. A linked worktree keeps the shallow file in its common
+// directory, so the temporary file is created there too.
+func (d *DotGit) shallowTempFile() (billy.File, error) {
+	if fs, ok := d.fs.(*RepositoryFilesystem); ok {
+		return fs.tempFileFor(shallowPath, tmpShallowPrefix)
+	}
+	return d.fs.TempFile("", tmpShallowPrefix)
+}
+
+// writeShallow writes the shallow file in place. It is the fallback for
+// filesystems that cannot rename over the existing file, such as sivafs.
+func (d *DotGit) writeShallow(content []byte) (err error) {
+	f, err := d.fs.Create(shallowPath)
+	if err != nil {
+		return err
+	}
+
+	defer ioutil.CheckClose(f, &err)
+	n, err := f.Write(content)
+	if err == nil && n != len(content) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 // Shallow returns a file pointer for read to the shallow file

@@ -120,6 +120,12 @@ func (fs *RepositoryFilesystem) TempFile(dir, prefix string) (billy.File, error)
 	return fs.mapToRepositoryFsByPath(dir).TempFile(dir, prefix)
 }
 
+// tempFileFor creates a temporary file in the filesystem that holds path, so
+// that renaming the temporary file over path stays on one filesystem.
+func (fs *RepositoryFilesystem) tempFileFor(path, prefix string) (billy.File, error) {
+	return fs.mapToRepositoryFsByPath(path).TempFile("", prefix)
+}
+
 // ReadDir reads a directory from the appropriate filesystem.
 func (fs *RepositoryFilesystem) ReadDir(path string) ([]fs.DirEntry, error) {
 	return fs.mapToRepositoryFsByPath(path).ReadDir(path)

@@ -1,9 +1,11 @@
 package filesystem_test
 
 import (
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-billy/v6/util"
 	"github.com/stretchr/testify/assert"
@@ -134,6 +136,98 @@ func TestShallowRoundTrip(t *testing.T) {
 	got, err := st.Shallow()
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
+}
+
+// failingWriteFS simulates an interrupted write: the temporary file cannot be
+// filled, so the new boundary must never replace the old one.
+type failingWriteFS struct {
+	billy.Filesystem
+}
+
+func (f failingWriteFS) TempFile(dir, prefix string) (billy.File, error) {
+	file, err := f.Filesystem.TempFile(dir, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	return failingWriteFile{File: file}, nil
+}
+
+type failingWriteFile struct {
+	billy.File
+}
+
+func (f failingWriteFile) Write([]byte) (int, error) {
+	return 0, assert.AnError
+}
+
+func TestSetShallowKeepsPreviousBoundaryWhenWriteFails(t *testing.T) {
+	t.Parallel()
+
+	mfs := memfs.New()
+	old := []plumbing.Hash{
+		plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5"),
+	}
+	require.NoError(t, filesystem.NewStorage(mfs, cache.NewObjectLRUDefault()).SetShallow(old))
+
+	st := filesystem.NewStorage(failingWriteFS{Filesystem: mfs}, cache.NewObjectLRUDefault())
+	err := st.SetShallow([]plumbing.Hash{
+		plumbing.NewHash("e8d3ffab552895c19b9fcf7aa264d277cde33881"),
+	})
+	require.ErrorIs(t, err, assert.AnError)
+
+	got, err := filesystem.NewStorage(mfs, cache.NewObjectLRUDefault()).Shallow()
+	require.NoError(t, err)
+	assert.Equal(t, old, got)
+}
+
+// renameFailureFS simulates a filesystem that cannot move the temporary
+// shallow file into place. The old boundary has to survive the failure.
+type renameFailureFS struct {
+	billy.Filesystem
+}
+
+func (f renameFailureFS) Rename(string, string) error {
+	return assert.AnError
+}
+
+func TestSetShallowKeepsPreviousBoundaryWhenRenameFails(t *testing.T) {
+	t.Parallel()
+
+	mfs := memfs.New()
+	old := []plumbing.Hash{
+		plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5"),
+	}
+	require.NoError(t, filesystem.NewStorage(mfs, cache.NewObjectLRUDefault()).SetShallow(old))
+
+	st := filesystem.NewStorage(renameFailureFS{Filesystem: mfs}, cache.NewObjectLRUDefault())
+	err := st.SetShallow([]plumbing.Hash{
+		plumbing.NewHash("e8d3ffab552895c19b9fcf7aa264d277cde33881"),
+	})
+	require.ErrorIs(t, err, assert.AnError)
+
+	got, err := filesystem.NewStorage(mfs, cache.NewObjectLRUDefault()).Shallow()
+	require.NoError(t, err)
+	assert.Equal(t, old, got)
+}
+
+func TestSetShallowRemovesFileWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	fs := memfs.New()
+	st := filesystem.NewStorage(fs, cache.NewObjectLRUDefault())
+	require.NoError(t, st.SetShallow([]plumbing.Hash{
+		plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5"),
+	}))
+
+	require.NoError(t, st.SetShallow(nil))
+
+	_, err := fs.Stat("shallow")
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	got, err := st.Shallow()
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }
 
 func TestShallowFollowsSetObjectFormat(t *testing.T) {

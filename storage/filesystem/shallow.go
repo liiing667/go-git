@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 
 	"github.com/go-git/go-git/v6/plumbing"
@@ -17,23 +18,22 @@ type ShallowStorage struct {
 	objectFormat formatcfg.ObjectFormat
 }
 
-// SetShallow save the shallows in the shallow file in the .git folder as one
+// SetShallow saves the shallows in the shallow file in the .git folder as one
 // commit per line represented by 40-byte hexadecimal object terminated by a
 // newline.
+//
+// The file is replaced atomically, so a write that fails or is interrupted
+// leaves the previous boundary intact. Git's shallow file is rewritten the
+// same way, through a lock file that is renamed into place. Removing the
+// boundary altogether, as unshallowing a repository does, removes the file,
+// which is what Git does once no commit is shallow.
 func (s *ShallowStorage) SetShallow(commits []plumbing.Hash) error {
-	f, err := s.dir.ShallowWriter()
-	if err != nil {
-		return err
-	}
-
-	defer ioutil.CheckClose(f, &err)
+	var content bytes.Buffer
 	for _, h := range commits {
-		if _, err := fmt.Fprintf(f, "%s\n", h); err != nil {
-			return err
-		}
+		_, _ = fmt.Fprintf(&content, "%s\n", h)
 	}
 
-	return err
+	return s.dir.ReplaceShallow(content.Bytes())
 }
 
 // Shallow returns the shallow commits reading from shallow file from .git.
