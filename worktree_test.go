@@ -6201,6 +6201,7 @@ func TestCleanKeepsNestedGitDirCaseVariant(t *testing.T) {
 			nested := filepath.Join(dir, "sub", spelling)
 			require.NoError(t, os.MkdirAll(nested, 0o755))
 			require.NoError(t, os.WriteFile(filepath.Join(nested, "HEAD"), []byte("ref: refs/heads/master\n"), 0o644))
+			require.NoError(t, os.WriteFile(filepath.Join(nested, "untracked"), []byte("keep\n"), 0o644))
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "untracked"), []byte("x"), 0o644))
 
 			w, err := r.Worktree()
@@ -6209,9 +6210,40 @@ func TestCleanKeepsNestedGitDirCaseVariant(t *testing.T) {
 
 			_, err = os.Stat(filepath.Join(nested, "HEAD"))
 			require.NoError(t, err, "Clean emptied the nested repository")
+			_, err = os.Stat(filepath.Join(nested, "untracked"))
+			require.NoError(t, err, "Clean removed a file from the nested repository")
 			_, err = os.Stat(filepath.Join(dir, "untracked"))
 			require.ErrorIs(t, err, os.ErrNotExist)
 		})
+	}
+}
+
+// Clean has no working tree to operate on when the worktree filesystem is
+// the repository's own Git directory. Treating HEAD, the shallow boundary
+// and the object store as untracked would destroy a repository that Status
+// cannot report as damaged.
+func TestCleanKeepsRepositoryWhenWorktreeIsGitDir(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st := filesystem.NewStorage(osfs.New(dir), cache.NewObjectLRUDefault())
+	_, err := Init(st)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "shallow"), []byte("boundary\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "untracked"), []byte("x"), 0o644))
+
+	r, err := Open(st, osfs.New(dir))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+
+	w, err := r.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, w.Clean(&CleanOptions{Dir: true}))
+
+	for _, name := range []string{"HEAD", "config", "shallow", "untracked"} {
+		_, err = os.Stat(filepath.Join(dir, name))
+		require.NoError(t, err, "Clean removed %q from the Git directory", name)
 	}
 }
 

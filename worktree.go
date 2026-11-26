@@ -1458,6 +1458,15 @@ func (w *Worktree) readGitmodulesFile() (*config.Modules, error) {
 // Clean the worktree by removing untracked files.
 // An empty dir could be removed - this is what  `git clean -f -d .` does.
 func (w *Worktree) Clean(opts *CleanOptions) error {
+	// A Worktree whose root is the storer's Git directory has no working
+	// tree to clean. Its entries are the repository itself - HEAD, index,
+	// objects, refs and, for a shallow clone, the shallow boundary - and
+	// removing them as untracked files would destroy the repository while
+	// leaving Status with nothing it recognises as damage.
+	if w.worktreeIsGitDir() {
+		return nil
+	}
+
 	s, err := w.Status()
 	if err != nil {
 		return err
@@ -1551,6 +1560,25 @@ func (g cleanGuard) foldsToLiteralGit(dir string, siblings []fs.DirEntry) bool {
 	return err == nil && fi.IsDir()
 }
 
+// isRepository reports whether the directory dir, whose listing is files,
+// is a nested Git repository. It recognises the same .git spellings as
+// skip, plus a .git that only the filesystem's name folding makes
+// reachable.
+func (g cleanGuard) isRepository(dir string, files []fs.DirEntry) bool {
+	for _, e := range files {
+		name := e.Name()
+		if isGitDirName(name, g.ignoreCase.IsTrue() || !g.ignoreCase.IsSet()) ||
+			pathutil.IsHFSDotGit(name) {
+			return true
+		}
+	}
+	// A case-insensitive or HFS+ filesystem can reach .git under a name the
+	// listing spells differently. A .git file is as much a repository
+	// marker as a directory, so only its presence matters here.
+	_, err := g.fs.Lstat(filepath.Join(dir, GitDirName))
+	return err == nil
+}
+
 // gitDirInfos returns the file information of the storer's Git directory
 // and, for a linked worktree, of its common directory. It returns nothing
 // for a storer that does not expose a filesystem, and leaves out a
@@ -1573,6 +1601,29 @@ func (w *Worktree) gitDirInfos() []os.FileInfo {
 	return infos
 }
 
+// worktreeIsGitDir reports whether the worktree root is the storer's Git
+// directory or, for a linked worktree, its common directory. In that layout
+// there is no working tree distinct from the repository, so Clean must not
+// treat the Git directory's own files as untracked.
+func (w *Worktree) worktreeIsGitDir() bool {
+	infos := w.gitDirInfos()
+	if len(infos) == 0 {
+		return false
+	}
+
+	fi, err := w.filesystem.Filesystem.Stat(".")
+	if err != nil {
+		return false
+	}
+
+	for _, d := range infos {
+		if os.SameFile(fi, d) {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *Worktree) doClean(status Status, opts *CleanOptions, guard cleanGuard, dir string, files []fs.DirEntry) error {
 	wfs := w.filesystem.walkFilesystem()
 	for _, fi := range files {
@@ -1590,6 +1641,14 @@ func (w *Worktree) doClean(status Status, opts *CleanOptions, guard cleanGuard, 
 			subfiles, err := wfs.ReadDir(path)
 			if err != nil {
 				return err
+			}
+			// Git's clean leaves a nested repository alone unless it is
+			// asked twice to remove it. CleanOptions has no second force
+			// level, so a directory holding a Git directory is never
+			// descended into: its files belong to that repository's
+			// working tree, not this one.
+			if guard.isRepository(path, subfiles) {
+				continue
 			}
 			err = w.doClean(status, opts, guard, path, subfiles)
 			if err != nil {
